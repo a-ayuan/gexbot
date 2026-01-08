@@ -9,7 +9,7 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 from tradier_client import TradierClient
-from gex_calc import (
+from utils.gex_calc import (
     GexConfig,
     compute_gex,
     options_to_df,
@@ -18,6 +18,12 @@ from gex_calc import (
     find_zero_gamma,
     calculate_max_pain,
     # volume_triggers,
+)
+
+from utils.vex_calc import (
+    VexConfig,
+    compute_vex,
+    vex_by_strike,
 )
 
 st.set_page_config(page_title="GEX Dashboard", layout="wide")
@@ -86,7 +92,7 @@ with st.sidebar:
 
     expiration = st.selectbox("Expiration", options=expirations, index=0)
 
-    st.subheader("GEX Convention")
+    st.subheader("GEX / VEX Convention")
     calls_pos = st.toggle("Calls + / Puts - (common)", value=True)
 
     st.subheader("Strike Window")
@@ -128,27 +134,35 @@ if np.isnan(spot):
     st.error("Could not determine spot price from quote.")
     st.stop()
 
-cfg = GexConfig(calls_positive_puts_negative=calls_pos)
+cfg_gex = GexConfig(calls_positive_puts_negative=calls_pos)
+cfg_vex = VexConfig(calls_positive_puts_negative=calls_pos)
 
 df_raw = options_to_df(chain)
-df_gex_all = compute_gex(df_raw, spot=spot, cfg=cfg)
+
+# GEX
+df_gex_all = compute_gex(df_raw, spot=spot, cfg=cfg_gex)
+
+# VEX
+df_vex_all = compute_vex(df_raw, cfg=cfg_vex)
 
 # Validate
 if df_gex_all.empty or "strike" not in df_gex_all.columns:
     st.error("No options data returned for this expiration.")
     st.stop()
 
-# Strike window around spot (N each side)
+# Strike window around spot (N each side) - use strikes from GEX df
 all_strikes = df_gex_all["strike"].dropna().to_numpy(dtype=float)
 strike_lo, strike_hi = strikes_window_around_spot(all_strikes, spot=float(spot), n_each_side=int(n_each_side))
+
 df_gex = df_gex_all[(df_gex_all["strike"] >= strike_lo) & (df_gex_all["strike"] <= strike_hi)].copy()
+df_vex = df_vex_all[(df_vex_all["strike"] >= strike_lo) & (df_vex_all["strike"] <= strike_hi)].copy()
 
 # Aggregate
 df_strike = gex_by_strike(df_gex)
+df_vstrike = vex_by_strike(df_vex)
 
 # Ensure net_gex exists (and is numeric)
 if "net_gex" not in df_strike.columns:
-    # Fallback: compute from contract-level gex
     tmp = df_gex.copy()
     tmp["gex"] = tmp.get("gex", 0.0)
     df_strike = df_strike.merge(
@@ -156,36 +170,34 @@ if "net_gex" not in df_strike.columns:
         on="strike",
         how="left",
     )
-
 df_strike["net_gex"] = pd.to_numeric(df_strike["net_gex"], errors="coerce").fillna(0.0)
 
 call_wall, put_wall = call_put_walls(df_strike)
 zero_gamma = find_zero_gamma(df_strike, spot=spot)
 net_gex = float(df_strike["net_gex"].sum()) if not df_strike.empty else 0.0
 
-# Max Pain (use full chain df_raw by default)
+# Max Pain (use full chain df_raw by default) - still used for GEX metrics + GEX chart
 max_pain = calculate_max_pain(df_raw)
 
 # ---------------------------
 # Header metrics
 # ---------------------------
-c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
 c1.metric("Spot", f"{spot:,.2f}")
 c2.metric("Net GEX", f"{net_gex:,.0f}")
-c3.metric("Call Wall", f"{call_wall:,.0f}" if call_wall is not None else "—")
-c4.metric("Put Wall", f"{put_wall:,.0f}" if put_wall is not None else "—")
-c5.metric("Zero Gamma", f"{zero_gamma:,.2f}" if zero_gamma is not None else "—")
-c6.metric("Max Pain", f"{max_pain:,.0f}" if max_pain is not None else "—")
+c4.metric("Call Wall", f"{call_wall:,.0f}" if call_wall is not None else "—")
+c5.metric("Put Wall", f"{put_wall:,.0f}" if put_wall is not None else "—")
+c6.metric("Zero Gamma", f"{zero_gamma:,.2f}" if zero_gamma is not None else "—")
+c7.metric("Max Pain", f"{max_pain:,.0f}" if max_pain is not None else "—")
 
 st.divider()
 
 # ---------------------------
-# Chart
+# GEX Chart
 # ---------------------------
 fig = go.Figure()
 
 if not df_strike.empty:
-    # Color net bars by sign: positive = green, negative = red
     bar_colors = np.where(df_strike["net_gex"].to_numpy() >= 0, "green", "red")
 
     fig.add_trace(
@@ -207,7 +219,6 @@ if not df_strike.empty:
     strike_max = float(df_strike["strike"].max())
     ypad = (strike_max - strike_min) * 0.02 if strike_max > strike_min else 1.0
 
-    # Spot line (blue)
     fig.add_hline(y=spot, line_width=2, line_dash="dash", line_color="blue", annotation_text="Spot")
 
     if call_wall is not None:
@@ -225,12 +236,59 @@ if not df_strike.empty:
         yaxis_title="Strike",
         height=720,
         xaxis=dict(range=[-chart_range, chart_range], zeroline=True, zerolinewidth=2),
-        # Keep user zoom/pan on reruns (refresh/live)
-        uirevision=f"{symbol}-{expiration}-{int(calls_pos)}",
+        uirevision=f"{symbol}-{expiration}-{int(calls_pos)}-gex",
     )
     fig.update_yaxes(range=[strike_min - ypad, strike_max + ypad])
 
 st.plotly_chart(fig, use_container_width=True)
+
+# ---------------------------
+# VEX Chart
+# ---------------------------
+fig_vex = go.Figure()
+
+if not df_vstrike.empty:
+    fig_vex.add_trace(
+        go.Bar(
+            x=df_vstrike["call_vex"],
+            y=df_vstrike["strike"],
+            orientation="h",
+            name="Call VEX",
+        )
+    )
+    fig_vex.add_trace(
+        go.Bar(
+            x=-df_vstrike["put_vex"].abs(),
+            y=df_vstrike["strike"],
+            orientation="h",
+            name="Put VEX",
+        )
+    )
+
+    # symmetric range based on max abs across both series
+    max_call = float(df_vstrike["call_vex"].abs().max())
+    max_put = float(df_vstrike["put_vex"].abs().max())
+    max_abs_v = max(max_call, max_put) or 1.0
+    vex_range = max_abs_v * 1.3
+
+    strike_min_v = float(df_vstrike["strike"].min())
+    strike_max_v = float(df_vstrike["strike"].max())
+    ypad_v = (strike_max_v - strike_min_v) * 0.02 if strike_max_v > strike_min_v else 1.0
+
+    fig_vex.add_hline(y=spot, line_width=2, line_dash="dash", line_color="blue", annotation_text="Spot")
+
+    fig_vex.update_layout(
+        barmode="overlay",
+        title=f"{symbol} Vega Exposure by Strike (Calls vs Puts) ({expiration})",
+        xaxis_title="VEX",
+        yaxis_title="Strike",
+        height=720,
+        xaxis=dict(range=[-vex_range, vex_range], zeroline=True, zerolinewidth=2),
+        uirevision=f"{symbol}-{expiration}-{int(calls_pos)}-vex",
+    )
+    fig_vex.update_yaxes(range=[strike_min_v - ypad_v, strike_max_v + ypad_v])
+
+st.plotly_chart(fig_vex, use_container_width=True)
 
 # # ---------------------------
 # # Volume Triggers
@@ -248,7 +306,7 @@ st.divider()
 # ---------------------------
 # Tabs
 # ---------------------------
-tab1, tab2, tab3 = st.tabs(["By strike", "Contracts (filtered)", "Quote"])
+tab1, tab2, tab3, tab4 = st.tabs(["By strike (GEX)", "Contracts (filtered)", "Quote", "By strike (VEX)"])
 
 with tab1:
     st.dataframe(df_strike.reset_index(drop=True), use_container_width=True, height=520)
@@ -256,17 +314,29 @@ with tab1:
 with tab2:
     cols = [
         c
-        for c in ["symbol", "option_type", "strike", "open_interest", "volume", "greeks.gamma", "gex"]
+        for c in ["symbol", "option_type", "strike", "open_interest", "volume", "greeks.gamma", "gex", "greeks.vega", "vex"]
         if c in df_gex.columns
     ]
+    merged = df_gex.copy()
+    if "vex" not in merged.columns and "vex" in df_vex.columns:
+        merged = merged.merge(
+            df_vex[["symbol", "option_type", "strike", "vex"]],
+            on=["symbol", "option_type", "strike"],
+            how="left",
+        )
+        cols = [c for c in cols if c != "vex"] + (["vex"] if "vex" in merged.columns else [])
+
     st.dataframe(
-        df_gex[cols].sort_values(["strike", "option_type"]).reset_index(drop=True),
+        merged[cols].sort_values(["strike", "option_type"]).reset_index(drop=True),
         use_container_width=True,
         height=520,
     )
 
 with tab3:
     st.json(quote)
+
+with tab4:
+    st.dataframe(df_vstrike.reset_index(drop=True), use_container_width=True, height=520)
 
 eastern = tz.gettz("America/New_York")
 st.caption(f"Last updated: {datetime.now(tz=eastern).strftime('%Y-%m-%d %H:%M:%S %Z')}")
