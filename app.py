@@ -106,8 +106,8 @@ with st.sidebar:
     live = st.toggle("Live updates", value=False, key="live_updates")
     interval_s = st.number_input(
         "Refresh interval (seconds)",
-        min_value=1,
-        value=5,
+        min_value=5,
+        value=10,
         step=1,
         disabled=not live,
         key="refresh_interval_s",
