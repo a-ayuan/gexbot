@@ -27,7 +27,8 @@ from utils.vex_calc import (
 
 from utils.vanna_calc import (
     VannaConfig,
-    vanna_curve_for_expiration,
+    compute_vanna,
+    vanna_by_strike,
 )
 
 st.set_page_config(page_title="GEX Dashboard", layout="wide")
@@ -121,12 +122,10 @@ def _is_valid_quote_for_symbol(q: object, symbol: str) -> bool:
         if "not found" in lowered and ("symbol" in lowered or "ticker" in lowered):
             return False
 
-    # If spot is present and finite, that's a strong signal the symbol is valid
     spot = _extract_spot_from_quote(q)
     if np.isfinite(spot) and spot > 0:
         return True
 
-    # Fallback: some responses include the resolved symbol
     qs = str(q.get("symbol") or "").upper().strip()
     if qs and qs == str(symbol).upper().strip():
         return True
@@ -165,14 +164,6 @@ def fetch_expirations(token: str, symbol: str):
     except Exception:
         return []
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_chain(token: str, symbol: str, expiration: str):
-    c = TradierClient(token=token)
-    try:
-        return c.get_chain(symbol=symbol, expiration=expiration, greeks=True)
-    except Exception:
-        return []
-
 def _safe_parse_expiration(expiration: str) -> date | None:
     try:
         return datetime.strptime(str(expiration), "%Y-%m-%d").date()
@@ -180,15 +171,28 @@ def _safe_parse_expiration(expiration: str) -> date | None:
         return None
 
 def _closest_expiration_by_dte(exp_df: pd.DataFrame, target_dte: int) -> str:
-    """
-    Pick the expiration whose DTE is closest to target_dte.
-    exp_df must have columns: expiration (str), dte (int)
-    """
     if exp_df.empty:
         return ""
     target_dte = int(target_dte)
     i = (exp_df["dte"].astype(int) - target_dte).abs().idxmin()
     return str(exp_df.loc[i, "expiration"])
+
+def _tte_years(expiration: str) -> float:
+    """
+    Time-to-expiration in years, computed in America/New_York timezone.
+    Uses end-of-day assumption for expiration (16:00 ET) to avoid 0 on same-day.
+    """
+    eastern = tz.gettz("America/New_York")
+    now = datetime.now(tz=eastern)
+
+    try:
+        d = datetime.strptime(str(expiration), "%Y-%m-%d").date()
+    except Exception:
+        return 0.0
+
+    exp_dt = datetime(d.year, d.month, d.day, 16, 0, 0, tzinfo=eastern)
+    t = (exp_dt - now).total_seconds() / (365.0 * 24.0 * 3600.0)
+    return float(max(t, 0.0))
 
 # ---------------------------
 # Sidebar controls
@@ -201,19 +205,16 @@ with st.sidebar:
         st.error("Missing Tradier token. Set TRADIER_TOKEN env var or .streamlit/secrets.toml.")
         st.stop()
 
-    # Session state for persistent DTE across ticker changes
     if "prev_symbol" not in st.session_state:
         st.session_state.prev_symbol = "SPY"
     if "selected_dte" not in st.session_state:
-        st.session_state.selected_dte = 0  # persists across tickers
+        st.session_state.selected_dte = 0
 
     symbol = st.text_input("Ticker", value=st.session_state.prev_symbol).upper().strip()
 
     q_check = fetch_quote(token, symbol)
     if not _is_valid_quote_for_symbol(q_check, symbol):
-        st.warning(
-            f"Invalid ticker: **{symbol}**. Please enter a valid symbol (e.g., SPY, QQQ, AAPL)."
-        )
+        st.warning(f"Invalid ticker: **{symbol}**. Please enter a valid symbol (e.g., SPY, QQQ, AAPL).")
         st.stop()
 
     expirations = fetch_expirations(token, symbol)
@@ -224,7 +225,6 @@ with st.sidebar:
         )
         st.stop()
 
-    # Build expiration->DTE table
     today_et = datetime.now(tz=tz.gettz("America/New_York")).date()
     exp_meta = []
     for exp in expirations:
@@ -241,14 +241,11 @@ with st.sidebar:
         st.error("No non-expired expirations available.")
         st.stop()
 
-    # Determine default expiration index:
     ticker_changed = symbol != st.session_state.prev_symbol
     if ticker_changed:
         st.session_state.prev_symbol = symbol
-        # keep selected_dte as-is, choose closest expiration
         default_exp = _closest_expiration_by_dte(exp_df, st.session_state.selected_dte)
     else:
-        # if we already have an expiration selected, keep it if valid; otherwise choose closest by DTE
         prev_exp = st.session_state.get("expiration_select", "")
         if prev_exp and (prev_exp in exp_df["expiration"].tolist()):
             default_exp = prev_exp
@@ -266,39 +263,11 @@ with st.sidebar:
         help="Date-based expiration selector. Your last DTE preference is preserved when you change tickers.",
     )
 
-    # Update persisted DTE whenever user picks a new date
     try:
         st.session_state.selected_dte = int(exp_df.loc[exp_df["expiration"] == expiration, "dte"].iloc[0])
     except Exception:
         pass
-
-    st.subheader("GEX / VEX Convention")
-    calls_pos = st.toggle("Calls + / Puts - (common)", value=True)
-
-    st.subheader("Strike Window")
-    n_each_side = st.number_input(
-        "Strikes each side of spot",
-        min_value=1,
-        value=25,
-        step=1,
-        help="Used for GEX/VEX strike charts AND as the 'near-the-money' filter for Vanna curves.",
-        key="n_each_side",
-    )
-    st.caption(f"Window: {2 * int(n_each_side) + 1} strikes total (nearest to spot).")
-
-    st.subheader("Vanna settings")
-    vanna_max_dte = st.number_input(
-        "Max DTE for Vanna curves",
-        min_value=0,
-        value=190,
-        step=1,
-        help="Only expirations with DTE <= this value are included in Vanna curves.",
-        key="vanna_max_dte",
-    )
-
-    st.subheader("Refresh")
-    refresh = st.button("Refresh now", key="refresh_now")
-
+    
     live = st.toggle("Live updates", value=False, key="live_updates")
     interval_s = st.number_input(
         "Refresh interval (seconds)",
@@ -309,7 +278,41 @@ with st.sidebar:
         key="refresh_interval_s",
     )
 
-# Live autorefresh
+    st.subheader("GEX / VEX Convention")
+    calls_pos = st.toggle("Calls + / Puts - (common)", value=True)
+
+    st.subheader("Strike Window")
+    n_each_side = st.number_input(
+        "Strikes each side of spot",
+        min_value=1,
+        value=25,
+        step=1,
+        help="Used for GEX/VEX/Vanna strike charts.",
+        key="n_each_side",
+    )
+    st.caption(f"Window: {2 * int(n_each_side) + 1} strikes total (nearest to spot).")
+
+    st.subheader("Vanna model inputs")
+    r_rate = st.number_input(
+        "Risk-free rate (annual, decimal)",
+        min_value=0.0,
+        value=0.00,
+        step=0.01,
+        help="Used for BS d1 (optional). Leave 0.00 if you don't want to model rates.",
+        key="rf_rate",
+    )
+    q_yield = st.number_input(
+        "Dividend yield (annual, decimal)",
+        min_value=0.0,
+        value=0.00,
+        step=0.01,
+        help="Used for BS d1 (optional). Leave 0.00 if you don't want to model dividends.",
+        key="div_yield",
+    )
+
+    st.subheader("Refresh")
+    refresh = st.button("Refresh now", key="refresh_now")
+
 if live:
     st_autorefresh(interval=int(interval_s * 1000), key="auto_refresh_key")
 
@@ -324,11 +327,11 @@ if np.isnan(spot):
     st.error("Could not determine spot price from quote.")
     st.stop()
 
+df_raw = options_to_df(chain)
+
 cfg_gex = GexConfig(calls_positive_puts_negative=calls_pos)
 cfg_vex = VexConfig(calls_positive_puts_negative=calls_pos)
 cfg_vanna = VannaConfig(calls_positive_puts_negative=calls_pos)
-
-df_raw = options_to_df(chain)
 
 # GEX
 df_gex_all = compute_gex(df_raw, spot=spot, cfg=cfg_gex)
@@ -336,23 +339,32 @@ df_gex_all = compute_gex(df_raw, spot=spot, cfg=cfg_gex)
 # VEX
 df_vex_all = compute_vex(df_raw, cfg=cfg_vex)
 
-# Validate
+# VANNA (computed from IV + BS + (optional) provider vega)
+T = _tte_years(expiration)
+df_vanna_all = compute_vanna(
+    df_raw,
+    spot=float(spot),
+    t_years=float(T),
+    r=float(r_rate),
+    q=float(q_yield),
+    cfg=cfg_vanna,
+)
+
 if df_gex_all.empty or "strike" not in df_gex_all.columns:
     st.error("No options data returned for this expiration.")
     st.stop()
 
-# Strike window around spot (N each side) - use strikes from GEX df
 all_strikes = df_gex_all["strike"].dropna().to_numpy(dtype=float)
 strike_lo, strike_hi = strikes_window_around_spot(all_strikes, spot=float(spot), n_each_side=int(n_each_side))
 
 df_gex = df_gex_all[(df_gex_all["strike"] >= strike_lo) & (df_gex_all["strike"] <= strike_hi)].copy()
 df_vex = df_vex_all[(df_vex_all["strike"] >= strike_lo) & (df_vex_all["strike"] <= strike_hi)].copy()
+df_vanna = df_vanna_all[(df_vanna_all["strike"] >= strike_lo) & (df_vanna_all["strike"] <= strike_hi)].copy()
 
-# Aggregate
 df_strike = gex_by_strike(df_gex)
 df_vstrike = vex_by_strike(df_vex)
+df_vanna_strike = vanna_by_strike(df_vanna)
 
-# Ensure net_gex exists (and is numeric)
 if "net_gex" not in df_strike.columns:
     tmp = df_gex.copy()
     tmp["gex"] = tmp.get("gex", 0.0)
@@ -367,10 +379,7 @@ call_wall, put_wall = call_put_walls(df_strike)
 zero_gamma = find_zero_gamma(df_strike, spot=spot)
 net_gex = float(df_strike["net_gex"].sum()) if not df_strike.empty else 0.0
 
-# Max Pain (use full chain df_raw by default)
 max_pain = calculate_max_pain(df_raw)
-
-# Current selected DTE for display
 selected_dte = int(st.session_state.get("selected_dte", 0))
 
 # ---------------------------
@@ -426,7 +435,7 @@ if not df_strike.empty:
         fig.add_hline(y=max_pain, line_width=2, line_dash="solid", line_color="purple", annotation_text="Max Pain")
 
     fig.update_layout(
-        title=f"{symbol} Net GEX by Strike ({expiration})",
+        title=f"${symbol} Net GEX by Strike ({expiration})",
         xaxis_title="Net GEX ($Gamma per 1% move)",
         yaxis_title="Strike",
         height=720,
@@ -473,7 +482,7 @@ if not df_vstrike.empty:
 
     fig_vex.update_layout(
         barmode="overlay",
-        title=f"{symbol} Vega Exposure by Strike (Calls vs Puts) ({expiration})",
+        title=f"${symbol} Vega Exposure by Strike ({expiration})",
         xaxis_title="VEX",
         yaxis_title="Strike",
         height=720,
@@ -485,105 +494,118 @@ if not df_vstrike.empty:
 st.plotly_chart(fig_vex, use_container_width=True)
 
 # ---------------------------
-# VANNA Curves
+# VANNA Chart
 # ---------------------------
-st.subheader("Vanna Curves: Net Vega Hedging Exposure vs Implied Volatility")
+vanna_chart_slot = st.empty()
 
-IV_BINS = 18
-
-# restrict expirations used for vanna curves
-vanna_exp_df = exp_df[exp_df["dte"].astype(int) <= int(vanna_max_dte)].copy()
-
-curves = []
-for exp, dte_val in vanna_exp_df[["expiration", "dte"]].itertuples(index=False, name=None):
-    chain_i = fetch_chain(token, symbol, exp)
-    df_i = options_to_df(chain_i)
-    if df_i.empty or "strike" not in df_i.columns:
-        continue
-
-    df_vex_i = compute_vex(df_i, cfg=cfg_vex)
-
-    # Near-the-money filter using strike window around spot (same N each side setting)
-    strikes_i = df_vex_i["strike"].dropna().to_numpy(dtype=float) if "strike" in df_vex_i.columns else np.array([])
-    lo_i, hi_i = strikes_window_around_spot(strikes_i, spot=float(spot), n_each_side=int(n_each_side))
-    df_vex_i = df_vex_i[(df_vex_i["strike"] >= lo_i) & (df_vex_i["strike"] <= hi_i)].copy()
-
-    curve_df = vanna_curve_for_expiration(
-        df_vex=df_vex_i,
-        dte=int(dte_val),
-        expiration=str(exp),
-        cfg=cfg_vanna,
-        n_iv_bins=IV_BINS,
-    )
-    if curve_df is not None and not curve_df.empty:
-        curves.append(curve_df)
-
-df_vanna_curves = pd.concat(curves, ignore_index=True) if curves else pd.DataFrame()
+# Toggle shown below the chart (render chart via placeholder after)
+vanna_view = st.radio(
+    "Display Vanna exposure",
+    options=["Both", "Calls", "Puts"],
+    horizontal=True,
+    key="vanna_view",
+)
 
 fig_vanna = go.Figure()
 
-if not df_vanna_curves.empty:
-    # One trace per DTE
-    for dte_val, g in df_vanna_curves.groupby("dte", sort=True):
-        g = g.sort_values("iv")
-        fig_vanna.add_trace(
-            go.Scatter(
-                x=g["iv"],
-                y=g["net_vega_hedge_exposure"],
-                mode="lines+markers",
-                name=f"{int(dte_val)} DTE",
-                text=g.apply(lambda r: f"Exp: {r['expiration']}<br>DTE: {r['dte']}<br>IV bin: {r['iv_bin']}", axis=1),
-                hovertemplate=(
-                    "IV: %{x:.4f}<br>"
-                    "Net Vega Hedge: %{y:,.0f}<br>"
-                    "%{text}<extra></extra>"
-                ),
-            )
+if not df_vanna_strike.empty:
+    max_call = float(df_vanna_strike["call_vanna"].abs().max()) if "call_vanna" in df_vanna_strike.columns else 0.0
+    max_put = float(df_vanna_strike["put_vanna"].abs().max()) if "put_vanna" in df_vanna_strike.columns else 0.0
+    max_abs = max(max_call, max_put) or 1.0
+    vanna_range = max_abs * 1.3
+
+    strike_min_v = float(df_vanna_strike["strike"].min())
+    strike_max_v = float(df_vanna_strike["strike"].max())
+    ypad_v = (strike_max_v - strike_min_v) * 0.02 if strike_max_v > strike_min_v else 1.0
+
+    show_calls = vanna_view in ("Both", "Calls")
+    show_puts = vanna_view in ("Both", "Puts")
+
+    fig_vanna.add_trace(
+        go.Bar(
+            x=df_vanna_strike["call_vanna"],
+            y=df_vanna_strike["strike"],
+            orientation="h",
+            name="Call Vanna",
+            marker_color='rgba(200, 0, 0, 0.5)',
+            visible=show_calls,
         )
-
-    fig_vanna.update_layout(
-        title=f"{symbol} Vanna Curves — Near-ATM only (Max DTE: {int(vanna_max_dte)})",
-        xaxis_title="Implied Volatility (binned; netted across near-ATM contracts within each bin)",
-        yaxis_title="Net Vega Hedging Exposure (netted across near-ATM contracts in each IV bin)",
-        height=620,
-        legend_title="Curve DTE",
-        uirevision=f"{symbol}-{int(calls_pos)}-vanna-curves",
     )
-else:
-    fig_vanna.update_layout(
-        title="No vanna curves available (missing IV / vega / OI or no chains).",
-        height=620,
-        uirevision=f"{symbol}-{int(calls_pos)}-vanna-curves",
+    fig_vanna.add_trace(
+        go.Bar(
+            x=-df_vanna_strike["put_vanna"].abs(),
+            y=df_vanna_strike["strike"],
+            orientation="h",
+            name="Put Vanna",
+            marker_color='rgba(0, 200, 0, 0.5)',
+            visible=show_puts,
+        )
     )
 
-st.plotly_chart(fig_vanna, use_container_width=True)
+    fig_vanna.add_hline(y=spot, line_width=2, line_dash="dash", line_color="blue", annotation_text="Spot")
+
+    fig_vanna.update_layout(
+        barmode="overlay",
+        title=f"${symbol} Vanna Exposure by Strike ({expiration})",
+        xaxis_title="Vanna Exposure",
+        yaxis_title="Strike",
+        height=720,
+        xaxis=dict(range=[-vanna_range, vanna_range], zeroline=True, zerolinewidth=2),
+        # Keep uirevision stable so Plotly UI state doesn't jump around
+        uirevision=f"{symbol}-{expiration}-{int(calls_pos)}-vanna",
+    )
+    fig_vanna.update_yaxes(range=[strike_min_v - ypad_v, strike_max_v + ypad_v])
+
+# Render chart above toggle
+vanna_chart_slot.plotly_chart(fig_vanna, use_container_width=True)
 
 st.divider()
 
 # ---------------------------
 # Tabs
 # ---------------------------
-tab1, tab2, tab4, tab5, tab3 = st.tabs(
-    ["By strike (GEX)", "Contracts (filtered)", "By strike (VEX)", "Vanna curves (binned)", "Quote"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["By strike (GEX)", "Contracts (filtered)", "By strike (VEX)", "By strike (Vanna)", "Quote"]
 )
 
 with tab1:
     st.dataframe(df_strike.reset_index(drop=True), use_container_width=True, height=520)
 
 with tab2:
-    cols = [
-        c
-        for c in ["symbol", "option_type", "strike", "open_interest", "volume", "greeks.gamma", "gex", "greeks.vega", "vex"]
-        if c in df_gex.columns
-    ]
     merged = df_gex.copy()
+
     if "vex" not in merged.columns and "vex" in df_vex.columns:
         merged = merged.merge(
             df_vex[["symbol", "option_type", "strike", "vex"]],
             on=["symbol", "option_type", "strike"],
             how="left",
         )
-        cols = [c for c in cols if c != "vex"] + (["vex"] if "vex" in merged.columns else [])
+
+    if "vanna_ex" not in merged.columns and "vanna_ex" in df_vanna.columns:
+        keep = ["symbol", "option_type", "strike", "vanna_ex", "iv", "d1", "vanna"]
+        keep = [c for c in keep if c in df_vanna.columns]
+        merged = merged.merge(
+            df_vanna[keep],
+            on=["symbol", "option_type", "strike"],
+            how="left",
+        )
+
+    cols_pref = [
+        "symbol",
+        "option_type",
+        "strike",
+        "open_interest",
+        "volume",
+        "greeks.gamma",
+        "gex",
+        "greeks.vega",
+        "vex",
+        "iv",
+        "d1",
+        "vanna",
+        "vanna_ex",
+    ]
+    cols = [c for c in cols_pref if c in merged.columns]
 
     st.dataframe(
         merged[cols].sort_values(["strike", "option_type"]).reset_index(drop=True),
@@ -592,13 +614,13 @@ with tab2:
     )
 
 with tab3:
-    st.json(quote)
-
-with tab4:
     st.dataframe(df_vstrike.reset_index(drop=True), use_container_width=True, height=520)
 
+with tab4:
+    st.dataframe(df_vanna_strike.reset_index(drop=True), use_container_width=True, height=520)
+
 with tab5:
-    st.dataframe(df_vanna_curves.reset_index(drop=True), use_container_width=True, height=520)
+    st.json(quote)
 
 eastern = tz.gettz("America/New_York")
 st.caption(f"Last updated: {datetime.now(tz=eastern).strftime('%Y-%m-%d %H:%M:%S %Z')}")
