@@ -242,8 +242,6 @@ with st.sidebar:
         st.stop()
 
     # Determine default expiration index:
-    # - Keep user's DTE across ticker changes by choosing closest expiration by DTE
-    # - Still show date-based selection only
     ticker_changed = symbol != st.session_state.prev_symbol
     if ticker_changed:
         st.session_state.prev_symbol = symbol
@@ -311,7 +309,7 @@ with st.sidebar:
         key="refresh_interval_s",
     )
 
-# Live autorefresh (keeps user’s Plotly pan/zoom via uirevision below)
+# Live autorefresh
 if live:
     st_autorefresh(interval=int(interval_s * 1000), key="auto_refresh_key")
 
@@ -369,7 +367,7 @@ call_wall, put_wall = call_put_walls(df_strike)
 zero_gamma = find_zero_gamma(df_strike, spot=spot)
 net_gex = float(df_strike["net_gex"].sum()) if not df_strike.empty else 0.0
 
-# Max Pain (use full chain df_raw by default) - still used for GEX metrics + GEX chart
+# Max Pain (use full chain df_raw by default)
 max_pain = calculate_max_pain(df_raw)
 
 # Current selected DTE for display
@@ -525,7 +523,7 @@ df_vanna_curves = pd.concat(curves, ignore_index=True) if curves else pd.DataFra
 fig_vanna = go.Figure()
 
 if not df_vanna_curves.empty:
-    # One trace per DTE (different color per curve)
+    # One trace per DTE
     for dte_val, g in df_vanna_curves.groupby("dte", sort=True):
         g = g.sort_values("iv")
         fig_vanna.add_trace(

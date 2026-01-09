@@ -8,7 +8,7 @@ import pandas as pd
 class GexConfig:
     contract_size_default: int = 100
     # If True: calls +, puts -
-    # If False: calls -, puts + (some desks flip “dealer positioning” assumptions)
+    # If False: calls -, puts + (some desks flip "dealer positioning" assumptions)
     calls_positive_puts_negative: bool = True
 
 def options_to_df(options: list[dict]) -> pd.DataFrame:
@@ -86,10 +86,6 @@ def call_put_walls(strike_df: pd.DataFrame) -> Tuple[Optional[float], Optional[f
     put_wall = float(put_wall) if pd.notna(put_wall) else None
     
     return call_wall, put_wall
-
-from typing import Optional
-import numpy as np
-import pandas as pd
 
 def find_zero_gamma(
     strike_df: pd.DataFrame,
