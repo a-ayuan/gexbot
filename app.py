@@ -527,7 +527,7 @@ if not df_vanna_strike.empty:
             y=df_vanna_strike["strike"],
             orientation="h",
             name="Call Vanna",
-            marker_color='rgba(200, 0, 0, 0.5)',
+            marker_color='rgba(0, 200, 0, 0.5)',
             visible=show_calls,
         )
     )
@@ -537,7 +537,7 @@ if not df_vanna_strike.empty:
             y=df_vanna_strike["strike"],
             orientation="h",
             name="Put Vanna",
-            marker_color='rgba(0, 200, 0, 0.5)',
+            marker_color='rgba(200, 0, 0, 0.5)',
             visible=show_puts,
         )
     )
