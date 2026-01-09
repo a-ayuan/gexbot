@@ -87,85 +87,111 @@ def call_put_walls(strike_df: pd.DataFrame) -> Tuple[Optional[float], Optional[f
     
     return call_wall, put_wall
 
+from typing import Optional
+import numpy as np
+import pandas as pd
+
 def find_zero_gamma(
     strike_df: pd.DataFrame,
     spot: float,
     *,
     tie_breaker: str = "closest_to_spot",  # or "lowest_strike" / "highest_strike"
+    eps: float = 1e-12,
 ) -> Optional[float]:
     """
-    "Zero gamma" = strike where net_gex crosses 0.
-    "Optimal" here = crossing with the strongest local flip (max |slope|) rather than closest to spot.
+    Zero gamma = underlying level where net_gex crosses 0.
+    We treat:
+      - exact/near zeros as valid roots
+      - sign-change intervals as roots via linear interpolation
+    "Most significant" root defaults to closest-to-spot (matches standard dealer-regime interpretation).
 
-    slope ≈ (y1 - y0) / (x1 - x0) for the two strikes bracketing the sign change.
+    tie_breaker:
+      - closest_to_spot (default)
+      - lowest_strike
+      - highest_strike
     """
-    if strike_df.empty:
+    if strike_df is None or strike_df.empty:
         return None
 
-    sdf = strike_df[["strike", "net_gex"]].dropna().sort_values("strike")
+    sdf = strike_df[["strike", "net_gex"]].dropna()
+    if sdf.empty:
+        return None
+
+    # sort, coerce numeric, and collapse duplicate strikes safely
+    sdf = (
+        sdf.assign(
+            strike=pd.to_numeric(sdf["strike"], errors="coerce"),
+            net_gex=pd.to_numeric(sdf["net_gex"], errors="coerce"),
+        )
+        .dropna()
+        .sort_values("strike")
+        .groupby("strike", as_index=False)["net_gex"].sum()
+    )
+
     if sdf.empty:
         return None
 
     x = sdf["strike"].to_numpy(dtype=float)
     y = sdf["net_gex"].to_numpy(dtype=float)
 
-    # If any strike is exactly zero net_gex, treat those as valid roots and choose the "best" among them
-    zero_idx = np.where(y == 0)[0]
-    if zero_idx.size:
-        roots = x[zero_idx]
-        if tie_breaker == "closest_to_spot":
-            return float(roots[np.argmin(np.abs(roots - spot))])
-        if tie_breaker == "lowest_strike":
-            return float(np.min(roots))
-        if tie_breaker == "highest_strike":
-            return float(np.max(roots))
-        return float(roots[0])
+    # If everything is ~0, zero gamma isn't uniquely defined
+    if np.all(np.isfinite(y)) and np.all(np.abs(y) <= eps):
+        # best practical choice: closest strike to spot
+        return float(x[np.argmin(np.abs(x - float(spot)))])
 
-    # Find sign changes (bracketing intervals)
-    sign = np.sign(y)
-    idx = np.where(sign[:-1] * sign[1:] < 0)[0]
-    if len(idx) == 0:
-        return None
+    roots = []
 
-    best_root = None
-    best_score = -float("inf")  # higher is better (|slope|)
-    best_dist = float("inf")
+    # 1) exact / near zeros at discrete strikes
+    near_zero_idx = np.where(np.abs(y) <= eps)[0]
+    for j in near_zero_idx:
+        roots.append(float(x[j]))
 
-    for i in idx:
+    # 2) sign-change crossings (bracketing intervals), ignore intervals touching ~0 already captured
+    for i in range(len(x) - 1):
         x0, x1 = x[i], x[i + 1]
         y0, y1 = y[i], y[i + 1]
 
-        dx = (x1 - x0)
-        dy = (y1 - y0)
-        if dx == 0 or dy == 0:
-            continue  # degenerate (shouldn't happen with sorted distinct strikes, but safe)
+        if not (np.isfinite(y0) and np.isfinite(y1)):
+            continue
 
-        # Linear interpolation root
-        root = x0 + (0 - y0) * dx / dy
+        # skip if either endpoint is ~0 (already added)
+        if abs(y0) <= eps or abs(y1) <= eps:
+            continue
 
-        # "Optimal" score: strongest local flip
-        slope_mag = abs(dy / dx)
+        # strict sign change
+        if y0 * y1 < 0:
+            dy = (y1 - y0)
+            dx = (x1 - x0)
+            if abs(dx) <= eps or abs(dy) <= eps:
+                continue
+            # linear interpolation: x0 + (0 - y0) * (x1-x0)/(y1-y0)
+            root = x0 + (-y0) * dx / dy
+            roots.append(float(root))
 
-        # Tie-breakers
-        dist = abs(root - spot)
+    if not roots:
+        return None
 
-        better = False
-        if slope_mag > best_score:
-            better = True
-        elif slope_mag == best_score:
-            if tie_breaker == "closest_to_spot" and dist < best_dist:
-                better = True
-            elif tie_breaker == "lowest_strike" and (best_root is None or root < best_root):
-                better = True
-            elif tie_breaker == "highest_strike" and (best_root is None or root > best_root):
-                better = True
+    roots = np.array(roots, dtype=float)
 
-        if better:
-            best_score = slope_mag
-            best_dist = dist
-            best_root = float(root)
+    # De-dup very-close roots (can happen if near-zero + crossing around same region)
+    roots.sort()
+    deduped = [roots[0]]
+    for r in roots[1:]:
+        if abs(r - deduped[-1]) > 1e-8:
+            deduped.append(r)
+    roots = np.array(deduped, dtype=float)
 
-    return best_root
+    # Choose "most significant" root:
+    # default = closest to spot, else extreme strike.
+    if tie_breaker == "closest_to_spot":
+        return float(roots[np.argmin(np.abs(roots - float(spot)))])
+    if tie_breaker == "lowest_strike":
+        return float(np.min(roots))
+    if tie_breaker == "highest_strike":
+        return float(np.max(roots))
+
+    # fallback
+    return float(roots[np.argmin(np.abs(roots - float(spot)))])
 
 def volume_triggers(strike_df: pd.DataFrame, top_n: int = 10) -> pd.DataFrame:
     """
